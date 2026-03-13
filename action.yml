@@ -1,0 +1,220 @@
+name: "Slack Notification"
+description: "Send Slack direct message to workflow trigger user"
+inputs:
+  slack_bot_token:
+    description: "Slack Bot Token"
+    required: true
+  github_app_token:
+    description: "GitHub App Token with read:org permissions (optional)"
+    required: false
+    default: ""
+  workflow_status:
+    description: "Workflow status (started, success, failure, cancelled)"
+    required: true
+  custom_message:
+    description: "Custom message to include"
+    required: false
+    default: ""
+  email_domain:
+    description: "Email domain for fallback user lookup (e.g., 'example.com'). Used when GitHub org email lookup fails."
+    required: false
+    default: ""
+  channel_id:
+    description: "Target Slack channel name (optional). If set, sends to channel instead of user."
+    required: false
+    default: ""
+
+runs:
+  using: "composite"
+  steps:
+    - name: Check if should notify
+      shell: bash
+      id: should_notify
+      run: |
+        set -euo pipefail
+        if [ "${{ github.event_name }}" = "workflow_dispatch" ] || [ "${{ github.event_name }}" = "pull_request" ] || [ "${{ github.event_name }}" = "schedule" ] || [ "${{ github.event_name }}" = "release" ]; then
+          echo "should_notify=true" >> $GITHUB_OUTPUT
+        else
+          echo "should_notify=false" >> $GITHUB_OUTPUT
+        fi
+
+    - name: Get GitHub user email
+      shell: bash
+      id: get_email
+      if: steps.should_notify.outputs.should_notify == 'true' && inputs.channel_id == ''
+      run: |
+        set -euo pipefail
+        USER_EMAIL=""
+        ACTOR="${{ github.actor }}"
+        ORG="${{ github.repository_owner }}"
+        echo "🔍 Getting verified domain email for: $ACTOR in org: $ORG"
+
+        # Try GraphQL API if we have a GitHub App token with read:org permissions
+        if [ -n "${{ inputs.github_app_token }}" ]; then
+          echo "🔑 Using GitHub App token for organization email lookup"
+
+          GRAPHQL_RESPONSE=$(curl -s \
+            -H "Authorization: Bearer ${{ inputs.github_app_token }}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            "https://api.github.com/graphql" \
+            -d "{\"query\": \"query { user(login: \\\"$ACTOR\\\") { organizationVerifiedDomainEmails(login: \\\"$ORG\\\") } }\"}" 2>/dev/null)
+
+          echo "🔍 GraphQL Response: $GRAPHQL_RESPONSE"
+        else
+          echo "⚠️  No GitHub App token provided, skipping organization email lookup"
+          GRAPHQL_RESPONSE=""
+        fi
+
+        # Check if response is valid JSON and has data
+        if echo "$GRAPHQL_RESPONSE" | jq . >/dev/null 2>&1 && echo "$GRAPHQL_RESPONSE" | jq -e '.data.user.organizationVerifiedDomainEmails' >/dev/null 2>&1; then
+          ALL_EMAILS=$(echo "$GRAPHQL_RESPONSE" | jq -r '.data.user.organizationVerifiedDomainEmails[]' 2>/dev/null)
+
+          # Only process if we have emails
+          if [ -n "$ALL_EMAILS" ]; then
+            EMAIL_DOMAIN="${{ inputs.email_domain }}"
+            if [ -n "$EMAIL_DOMAIN" ]; then
+              # Prefer the configured email domain
+              USER_EMAIL=$(echo "$ALL_EMAILS" | grep "@${EMAIL_DOMAIN}$" | head -1 2>/dev/null)
+            fi
+            # If no match with configured domain, use the first available email
+            if [ -z "$USER_EMAIL" ]; then
+              USER_EMAIL=$(echo "$ALL_EMAILS" | head -1 2>/dev/null)
+            fi
+          else
+            echo "⚠️  No organization verified domain emails found for $ACTOR"
+          fi
+        fi
+
+        # Final fallback to username@email_domain
+        if [ -z "$USER_EMAIL" ] && [ -n "${{ inputs.email_domain }}" ]; then
+          echo "🔄 Using fallback email: ${ACTOR}@${{ inputs.email_domain }}"
+          USER_EMAIL="${ACTOR}@${{ inputs.email_domain }}"
+        elif [ -z "$USER_EMAIL" ]; then
+          echo "❌ No email found and no email_domain configured. Cannot resolve Slack user."
+          echo "user_email=" >> $GITHUB_OUTPUT
+          exit 0
+        fi
+
+        echo "📧 Email to lookup in Slack: $USER_EMAIL"
+        echo "user_email=$USER_EMAIL" >> $GITHUB_OUTPUT
+
+    - name: Lookup Slack User ID by Email
+      shell: bash
+      id: get_user_id
+      if: steps.should_notify.outputs.should_notify == 'true' && inputs.channel_id == ''
+      run: |
+        set -euo pipefail
+        USER_EMAIL="${{ steps.get_email.outputs.user_email }}"
+        echo "🔍 Looking up Slack User ID for email: $USER_EMAIL"
+
+        # Call Slack API to get User ID from email
+        SLACK_RESPONSE=$(curl -s \
+          -H "Authorization: Bearer ${{ inputs.slack_bot_token }}" \
+          "https://slack.com/api/users.lookupByEmail?email=$USER_EMAIL")
+
+        # Check if the response is valid and user was found
+        if echo "$SLACK_RESPONSE" | jq -e '.ok == true and .user.id' >/dev/null 2>&1; then
+          USER_ID=$(echo "$SLACK_RESPONSE" | jq -r '.user.id')
+          echo "✅ Found Slack User ID: $USER_ID for $USER_EMAIL"
+          echo "user_id=$USER_ID" >> $GITHUB_OUTPUT
+          echo "lookup_success=true" >> $GITHUB_OUTPUT
+        else
+          echo "❌ Failed to find Slack user for $USER_EMAIL"
+          echo "Response: $SLACK_RESPONSE"
+          echo "lookup_success=false" >> $GITHUB_OUTPUT
+        fi
+
+    - name: Send Direct Message to User ID
+      if: steps.should_notify.outputs.should_notify == 'true' && inputs.channel_id == '' && steps.get_user_id.outputs.lookup_success == 'true'
+      uses: slackapi/slack-github-action@91efab103c0de0a537f72a35f6b8cda0ee76bf0a # v2.1.1
+      with:
+        method: chat.postMessage
+        token: ${{ inputs.slack_bot_token }}
+        payload: |
+          {
+            "channel": "${{ steps.get_user_id.outputs.user_id }}",
+            "text": "Workflow ${{ inputs.workflow_status }}",
+            "blocks": [
+              {
+                "type": "section",
+                "text": {
+                  "type": "mrkdwn",
+                  "text": "*Workflow ${{ inputs.workflow_status }}* ${{ inputs.workflow_status == 'started' && '🚀' || inputs.workflow_status == 'success' && '✅' || inputs.workflow_status == 'failure' && '❌' || '📝' }}"
+                }
+              },
+              {
+                "type": "section",
+                "fields": [
+                  {
+                    "type": "mrkdwn",
+                    "text": "*Repository:*\n${{ github.repository }}"
+                  },
+                  {
+                    "type": "mrkdwn",
+                    "text": "*Workflow:*\n${{ github.workflow }}"
+                  },
+                  {
+                    "type": "mrkdwn",
+                    "text": "*Triggered by:*\n${{ github.actor }}"
+                  },
+                  {
+                    "type": "mrkdwn",
+                    "text": "*Run:*\n<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|#${{ github.run_number }}>"
+                  }
+                ]
+              },
+              {
+                "type": "section",
+                "text": {
+                  "type": "mrkdwn",
+                  "text": "_${{ inputs.custom_message || 'No additional message' }}_"
+                }
+              }
+            ]
+          }
+      continue-on-error: true
+
+    - name: Send Message to Channel
+      if: steps.should_notify.outputs.should_notify == 'true' && inputs.channel_id != ''
+      shell: bash
+      env:
+        SLACK_BOT_TOKEN: ${{ inputs.slack_bot_token }}
+        SLACK_CHANNEL_ID: ${{ inputs.channel_id }}
+        SLACK_MESSAGE: ${{ inputs.custom_message }}
+      run: |
+        set -euo pipefail
+
+        JOIN_RESPONSE=$(curl -s -X POST https://slack.com/api/conversations.join \
+          -H "Authorization: Bearer $SLACK_BOT_TOKEN" \
+          -H "Content-Type: application/json; charset=utf-8" \
+          -d "{\"channel\":\"$SLACK_CHANNEL_ID\"}")
+        if ! echo "$JOIN_RESPONSE" | jq -e '.ok == true' >/dev/null 2>&1; then
+          echo "Note: could not join channel ($(echo "$JOIN_RESPONSE" | jq -r '.error // "unknown"')) — bot may already be a member or lack channels:join scope"
+        fi
+
+        PAYLOAD=$(jq -n \
+          --arg channel "$SLACK_CHANNEL_ID" \
+          --arg text "$SLACK_MESSAGE" \
+          '{channel: $channel, text: $text}')
+        RESPONSE=$(curl -s -X POST https://slack.com/api/chat.postMessage \
+          -H "Authorization: Bearer $SLACK_BOT_TOKEN" \
+          -H "Content-Type: application/json; charset=utf-8" \
+          -d "$PAYLOAD")
+        echo "Slack API response: $RESPONSE"
+        if ! echo "$RESPONSE" | jq -e '.ok == true' >/dev/null 2>&1; then
+          echo "Slack API error: $(echo "$RESPONSE" | jq -r '.error // "unknown"')"
+          exit 1
+        fi
+        echo "Message sent to channel $SLACK_CHANNEL_ID"
+      continue-on-error: true
+
+    - name: Log notification result
+      shell: bash
+      if: steps.should_notify.outputs.should_notify == 'true' && inputs.channel_id == ''
+      run: |
+        set -euo pipefail
+        if [ "${{ steps.get_user_id.outputs.lookup_success }}" == "true" ]; then
+          echo "📱 Slack notification sent to ${{ github.actor }} (${{ steps.get_email.outputs.user_email }} → ${{ steps.get_user_id.outputs.user_id }})"
+        else
+          echo "❌ Slack notification failed - could not find user ${{ github.actor }} (${{ steps.get_email.outputs.user_email }}) in Slack workspace"
+        fi
