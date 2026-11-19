@@ -45,16 +45,16 @@ runs:
       run: |
         set -euo pipefail
         USER_EMAIL=""
-        ACTOR="${{ github.actor }}"
+        ACTOR="${GITHUB_ACTOR}"
         ORG="${{ github.repository_owner }}"
         echo "🔍 Getting verified domain email for: $ACTOR in org: $ORG"
 
         # Try GraphQL API if we have a GitHub App token with read:org permissions
-        if [ -n "${{ inputs.github_app_token }}" ]; then
+        if [ -n "${INPUTS_GITHUB_APP_TOKEN}" ]; then
           echo "🔑 Using GitHub App token for organization email lookup"
 
           GRAPHQL_RESPONSE=$(curl -s \
-            -H "Authorization: Bearer ${{ inputs.github_app_token }}" \
+            -H "Authorization: Bearer ${INPUTS_GITHUB_APP_TOKEN}" \
             -H "Accept: application/vnd.github.v3+json" \
             "https://api.github.com/graphql" \
             -d "{\"query\": \"query { user(login: \\\"$ACTOR\\\") { organizationVerifiedDomainEmails(login: \\\"$ORG\\\") } }\"}" 2>/dev/null)
@@ -71,7 +71,7 @@ runs:
 
           # Only process if we have emails
           if [ -n "$ALL_EMAILS" ]; then
-            EMAIL_DOMAIN="${{ inputs.email_domain }}"
+            EMAIL_DOMAIN="${INPUTS_EMAIL_DOMAIN}"
             if [ -n "$EMAIL_DOMAIN" ]; then
               # Prefer the configured email domain
               USER_EMAIL=$(echo "$ALL_EMAILS" | grep "@${EMAIL_DOMAIN}$" | head -1 2>/dev/null)
@@ -86,9 +86,9 @@ runs:
         fi
 
         # Final fallback to username@email_domain
-        if [ -z "$USER_EMAIL" ] && [ -n "${{ inputs.email_domain }}" ]; then
-          echo "🔄 Using fallback email: ${ACTOR}@${{ inputs.email_domain }}"
-          USER_EMAIL="${ACTOR}@${{ inputs.email_domain }}"
+        if [ -z "$USER_EMAIL" ] && [ -n "${INPUTS_EMAIL_DOMAIN}" ]; then
+          echo "🔄 Using fallback email: ${ACTOR}@${INPUTS_EMAIL_DOMAIN}"
+          USER_EMAIL="${ACTOR}@${INPUTS_EMAIL_DOMAIN}"
         elif [ -z "$USER_EMAIL" ]; then
           echo "❌ No email found and no email_domain configured. Cannot resolve Slack user."
           echo "user_email=" >> $GITHUB_OUTPUT
@@ -97,6 +97,9 @@ runs:
 
         echo "📧 Email to lookup in Slack: $USER_EMAIL"
         echo "user_email=$USER_EMAIL" >> $GITHUB_OUTPUT
+      env:
+        INPUTS_GITHUB_APP_TOKEN: ${{ inputs.github_app_token }}
+        INPUTS_EMAIL_DOMAIN: ${{ inputs.email_domain }}
 
     - name: Lookup Slack User ID by Email
       shell: bash
@@ -109,7 +112,7 @@ runs:
 
         # Call Slack API to get User ID from email
         SLACK_RESPONSE=$(curl -s \
-          -H "Authorization: Bearer ${{ inputs.slack_bot_token }}" \
+          -H "Authorization: Bearer ${INPUTS_SLACK_BOT_TOKEN}" \
           "https://slack.com/api/users.lookupByEmail?email=$USER_EMAIL")
 
         # Check if the response is valid and user was found
@@ -123,6 +126,8 @@ runs:
           echo "Response: $SLACK_RESPONSE"
           echo "lookup_success=false" >> $GITHUB_OUTPUT
         fi
+      env:
+        INPUTS_SLACK_BOT_TOKEN: ${{ inputs.slack_bot_token }}
 
     - name: Send Direct Message to User ID
       if: steps.should_notify.outputs.should_notify == 'true' && inputs.channel_id == '' && steps.get_user_id.outputs.lookup_success == 'true'
@@ -214,7 +219,7 @@ runs:
       run: |
         set -euo pipefail
         if [ "${{ steps.get_user_id.outputs.lookup_success }}" == "true" ]; then
-          echo "📱 Slack notification sent to ${{ github.actor }} (${{ steps.get_email.outputs.user_email }} → ${{ steps.get_user_id.outputs.user_id }})"
+          echo "📱 Slack notification sent to ${GITHUB_ACTOR} (${{ steps.get_email.outputs.user_email }} → ${{ steps.get_user_id.outputs.user_id }})"
         else
-          echo "❌ Slack notification failed - could not find user ${{ github.actor }} (${{ steps.get_email.outputs.user_email }}) in Slack workspace"
+          echo "❌ Slack notification failed - could not find user ${GITHUB_ACTOR} (${{ steps.get_email.outputs.user_email }}) in Slack workspace"
         fi
